@@ -32,6 +32,8 @@ def main():
     parser.add_argument("--device", type=str, default="auto", help="Device: cuda, cpu, mps, or auto")
     parser.add_argument("--checkpoint", type=str, default=None, help="Resume from checkpoint")
     parser.add_argument("--checkpoint_dir", type=str, default="checkpoints", help="Where checkpoints are written")
+    parser.add_argument("--auto_resume", action="store_true",
+                        help="If --checkpoint is not given and <checkpoint_dir>/lamollm_latest.pt exists, resume from it automatically (crash recovery)")
 
     # Percentage-based checkpointing / logging (default behavior)
     parser.add_argument("--checkpoint_every_pct", type=float, default=5.0,
@@ -90,6 +92,16 @@ def main():
     if args.checkpoint:
         info = trainer.load_checkpoint(args.checkpoint)
         print(f"Resuming from epoch {info['epoch'] + 1}, step {info['global_step']}")
+    elif args.auto_resume:
+        latest = os.path.join(args.checkpoint_dir, "lamollm_latest.pt")
+        if os.path.exists(latest):
+            print(f"Auto-resuming from last checkpoint: {latest}")
+            info = trainer.load_checkpoint(latest)
+            if trainer.step_count >= config.max_steps:
+                print("Last checkpoint already reached max_steps - nothing to train.")
+                return
+        else:
+            print("No previous checkpoint found - starting fresh.")
 
     print("Starting training...")
     results = trainer.train(

@@ -87,6 +87,30 @@ python scripts/train.py --config tiny \
 - Classic step-based saving still works if you need it:
   `--checkpoint_every_pct 0 --save_every 1000`.
 
+#### Crash recovery (Google Colab)
+
+Checkpoint writes are atomic (saved to a `.tmp` file first, then renamed), so a
+crash mid-save never corrupts the previous checkpoint. To survive Colab
+disconnects entirely:
+
+```python
+# Cell 1 - mount Drive so checkpoints outlive the runtime
+from google.colab import drive
+drive.mount('/content/drive')
+```
+
+```bash
+# Cell 2 - train into Drive, resuming automatically if a checkpoint exists
+!python scripts/train.py --config tiny --epochs 1 \
+    --checkpoint_dir /content/drive/MyDrive/LamoLLM/checkpoints \
+    --auto_resume
+```
+
+If the runtime crashes, reconnect and re-run the same cells:
+`--auto_resume` detects `lamollm_latest.pt` in the checkpoint dir and continues
+from that step (model + optimizer + LR schedule all restored). Because
+checkpoints fire every 5%, a crash costs you at most ~5% of progress.
+
 ### Generation
 
 ```bash

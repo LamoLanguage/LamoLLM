@@ -432,7 +432,12 @@ class Trainer:
             state['scheduler_step_count'] = self.scheduler.step_count
         if self.scaler is not None:
             state['scaler_state_dict'] = self.scaler.state_dict()
-        torch.save(state, path)
+        # Atomic write: save to a temp file first, then swap it in. If the
+        # process dies mid-save, the previous checkpoint stays intact instead
+        # of being left half-written/corrupt (critical on Colab/Drive).
+        tmp_path = path + ".tmp"
+        torch.save(state, tmp_path)
+        os.replace(tmp_path, path)
         if verbose:
             print(f"Checkpoint saved to {path}")
 
