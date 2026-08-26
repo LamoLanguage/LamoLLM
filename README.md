@@ -53,6 +53,40 @@ python scripts/train.py --config small --epochs 1
 python scripts/train.py --config tiny --epochs 1
 ```
 
+#### Progress logging & checkpoints (percentage-based)
+
+Training output is quiet by design: instead of one line per step, you get a
+**single log line every 5% of progress**, and a **checkpoint is saved every 5%**
+of progress. Example of what you will see:
+
+```
+Training plan: 12,200 steps (step 0 -> 12,200) | batch size 8 | checkpoints every 5% (20 saves) | logging every 5%
+[ 15.0%|###-----------------] step 1830/12200 | loss 6.4212 | ppl 616.28 | lr 3.00e-04 | 31,240 tok/s | ETA 00:04:52 | ckpt -> lamollm_latest.pt
+[ 20.0%|####---------------] step 2440/12200 | loss 6.0138 | ppl 409.42 | lr 3.00e-04 | 31,105 tok/s | ETA 00:04:34 | val_loss 5.9872 | ckpt -> lamollm_latest.pt
+...
+Final checkpoint -> checkpoints/lamollm_final.pt
+```
+
+Options:
+
+```bash
+python scripts/train.py --config tiny \
+    --checkpoint_every_pct 5 \      # checkpoint cadence in % of run (default 5)
+    --log_every_pct 5 \             # console log cadence in % (default 5)
+    --keep_all_checkpoints          # keep every milestone file, not just the latest
+```
+
+- Every milestone refreshes `checkpoints/lamollm_latest.pt` (safe to resume from).
+- With `--keep_all_checkpoints`, each milestone is also kept as
+  `lamollm_<pct>_step_<N>.pt` (e.g. `lamollm_25pct_step_3050.pt`).
+- The end of training always writes `checkpoints/lamollm_final.pt`.
+- Metrics for every milestone are appended to `checkpoints/train_log.jsonl`
+  (loss, ppl, lr, tokens/sec, eval loss) - handy for plotting afterwards.
+- Validation loss is computed on the dataset's `validation` split at each
+  milestone; pass `--no_eval` to disable.
+- Classic step-based saving still works if you need it:
+  `--checkpoint_every_pct 0 --save_every 1000`.
+
 ### Generation
 
 ```bash

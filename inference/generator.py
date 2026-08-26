@@ -1,6 +1,12 @@
 from typing import Optional, List
 import torch
 
+try:
+    import torch_xla.core.xla_model as xm
+    HAS_XLA = True
+except ImportError:
+    HAS_XLA = False
+
 from model.llm import LamoLLM
 from tokenizer.tokenizer import LamoTokenizer
 from config.model_config import LamoLLMConfig
@@ -8,9 +14,13 @@ from config.model_config import LamoLLMConfig
 
 def _resolve_device(device: str) -> torch.device:
     if device != 'auto':
+        if device == 'tpu' and HAS_XLA:
+            return xm.xla_device()
         return torch.device(device)
     if torch.cuda.is_available():
         return torch.device('cuda')
+    if HAS_XLA:
+        return xm.xla_device()
     if hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
         return torch.device('mps')
     return torch.device('cpu')
@@ -25,7 +35,9 @@ class LamoGenerator:
     @classmethod
     def from_checkpoint(cls, checkpoint_path: str, device: str = 'auto'):
         resolved = _resolve_device(device)
-        checkpoint = torch.load(checkpoint_path, map_location=resolved)
+        # weights_only=False is required: checkpoints contain the config dataclass.
+        # PyTorch >= 2.6 defaults to weights_only=True, which would crash here.
+        checkpoint = torch.load(checkpoint_path, map_location=resolved, weights_only=False)
         config = checkpoint['config']
         model = LamoLLM(config)
         model.load_state_dict(checkpoint['model_state_dict'])
