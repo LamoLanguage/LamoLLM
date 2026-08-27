@@ -17,7 +17,9 @@ class LamoLLMConfig:
     norm_eps: float = 1e-5
     flash_attention: bool = True
     dtype: str = "bfloat16"
-    tie_word_embeddings: bool = False
+    # Tying input/output embeddings saves ~vocab_size * d_model params (e.g. ~103M
+    # for the default config) and the matching AdamW optimizer state for them.
+    tie_word_embeddings: bool = True
 
     # Training
     batch_size: int = 8
@@ -29,6 +31,9 @@ class LamoLLMConfig:
     max_steps: int = 600000
     lr_scheduler: str = "cosine"
     min_lr: float = 3e-5
+    # Use bitsandbytes 8-bit AdamW to roughly halve optimizer state memory.
+    # Falls back to regular AdamW automatically if bitsandbytes isn't installed.
+    use_8bit_optimizer: bool = False
 
     # Tokenizer
     tokenizer_type: str = "gpt2"

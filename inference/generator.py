@@ -35,9 +35,7 @@ class LamoGenerator:
     @classmethod
     def from_checkpoint(cls, checkpoint_path: str, device: str = 'auto'):
         resolved = _resolve_device(device)
-        # weights_only=False is required: checkpoints contain the config dataclass.
-        # PyTorch >= 2.6 defaults to weights_only=True, which would crash here.
-        checkpoint = torch.load(checkpoint_path, map_location=resolved, weights_only=False)
+        checkpoint = torch.load(checkpoint_path, map_location=resolved)
         config = checkpoint['config']
         model = LamoLLM(config)
         model.load_state_dict(checkpoint['model_state_dict'])

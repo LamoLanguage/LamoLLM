@@ -25,11 +25,14 @@ class LamoLLM(nn.Module):
         if config.tie_word_embeddings:
             self.output.weight = self.token_embedding.weight
 
-        self.freqs_cis = precompute_freqs_cis(
+        freqs_cos, freqs_sin = precompute_freqs_cis(
             config.head_dim,
             config.max_seq_len * 2,
             theta=config.rope_theta
         )
+        # register_buffer so cos/sin move with .to(device) and are saved/skipped correctly
+        self.register_buffer("freqs_cos", freqs_cos, persistent=False)
+        self.register_buffer("freqs_sin", freqs_sin, persistent=False)
 
         self.apply(self._init_weights)
         self._count_parameters()
@@ -59,7 +62,7 @@ class LamoLLM(nn.Module):
         h = self.token_embedding(input_ids)
         h = self.dropout(h)
 
-        freqs_cis = self.freqs_cis[:seq_len].to(h.device)
+        freqs_cis = (self.freqs_cos[:seq_len], self.freqs_sin[:seq_len])
 
         for layer in self.layers:
             h = layer(h, freqs_cis)
@@ -79,6 +82,11 @@ class LamoLLM(nn.Module):
 
         return {"logits": logits, "loss": loss}
 
+    def set_gradient_checkpointing(self, enable: bool = True):
+        """Enable or disable gradient checkpointing on all transformer layers."""
+        for layer in self.layers:
+            layer.use_checkpoint = enable
+        print(f"Gradient checkpointing {'enabled' if enable else 'disabled'}")
     @torch.no_grad()
     def generate(
         self,

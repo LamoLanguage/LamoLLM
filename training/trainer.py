@@ -1,12 +1,11 @@
-import json
 import math
 import os
-import time
 from typing import Optional
 
 import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
+from tqdm import tqdm
 
 try:
     import torch_xla
@@ -65,12 +64,26 @@ class CosineScheduleWithWarmup:
         self.min_lr = min_lr
         self.base_lrs = [group['lr'] for group in optimizer.param_groups]
         self.step_count = 0
+        # Precompute 1D array of lr scales so step() is a simple array lookup
+        self._lr_table = self._build_table()
+
+    def _build_table(self) -> list:
+        table = []
+        for step in range(self.max_steps):
+            if step < self.warmup_steps:
+                scale = step / max(1, self.warmup_steps)
+            else:
+                progress = (step - self.warmup_steps) / max(1, self.max_steps - self.warmup_steps)
+                scale = 0.5 * (1.0 + math.cos(math.pi * progress))
+            table.append(scale)
+        return table
 
     def step(self):
-        self.step_count += 1
-        lr_scale = self._get_lr_scale()
+        step = min(self.step_count, self.max_steps - 1)
+        lr_scale = self._lr_table[step]
         for group, base_lr in zip(self.optimizer.param_groups, self.base_lrs):
             group['lr'] = max(base_lr * lr_scale, self.min_lr)
+        self.step_count += 1
 
     def _get_lr_scale(self) -> float:
         if self.step_count < self.warmup_steps:
@@ -78,159 +91,124 @@ class CosineScheduleWithWarmup:
         progress = (self.step_count - self.warmup_steps) / max(1, self.max_steps - self.warmup_steps)
         return 0.5 * (1.0 + math.cos(math.pi * progress))
 
-
-def _fmt_pct(value: float) -> str:
-    """Format a percentage compactly: 5 -> '5%', 2.5 -> '2.5%'."""
-    if abs(value - round(value)) < 1e-9:
-        return f"{int(round(value))}pct"
-    return f"{value:g}pct"
-
-
-def _fmt_duration(seconds: float) -> str:
-    seconds = max(0, int(seconds))
-    h, rem = divmod(seconds, 3600)
-    m, s = divmod(rem, 60)
-    if h > 0:
-        return f"{h}:{m:02d}:{s:02d}"
-    return f"{m:02d}:{s:02d}"
-
-
-def _render_bar(progress: float, width: int = 20) -> str:
-    filled = int(round(progress * width))
-    filled = min(width, max(0, filled))
-    return "#" * filled + "-" * (width - filled)
-
+    def get_last_lr(self) -> float:
+        step = min(self.step_count - 1, self.max_steps - 1)
+        return max(self._lr_table[step] * self.base_lrs[0], self.min_lr)
 
 class Trainer:
-    def __init__(self, model, config, tokenizer, device='auto'):
+    def __init__(self, model, config, tokenizer, device='auto', compile_model: bool = True,
+                 gradient_checkpointing: bool = True):
         self.device = get_device(device)
         self.is_tpu = self.device.type == 'xla'
-        self.model = model.to(self.device)
         self.config = config
         self.tokenizer = tokenizer
         self.use_amp = self.device.type == 'cuda'
 
-        self.optimizer = torch.optim.AdamW(
-            model.parameters(),
-            lr=config.learning_rate,
-            weight_decay=config.weight_decay,
-            betas=(0.9, 0.95)
-        )
+        # Fused AdamW is faster; torch.compile also reduces overhead
+        fused_available = hasattr(torch.optim, 'AdamW') and os.getenv('TORCH_CUDNN_V8_API_ENABLED') != '0'
 
-        # Scheduler is created here (not in train()) so that a checkpoint can be
-        # loaded BEFORE training starts and the LR schedule resumes correctly.
+        self.optimizer = None
+        if getattr(config, 'use_8bit_optimizer', False):
+            try:
+                import bitsandbytes as bnb
+                self.optimizer = bnb.optim.AdamW8bit(
+                    model.parameters(),
+                    lr=config.learning_rate,
+                    weight_decay=config.weight_decay,
+                    betas=(0.9, 0.95),
+                )
+                print("Using bitsandbytes AdamW8bit (reduced optimizer memory)")
+            except ImportError:
+                print("bitsandbytes not installed, falling back to regular AdamW "
+                      "(pip install bitsandbytes to enable use_8bit_optimizer)")
+
+        if self.optimizer is None:
+            self.optimizer = torch.optim.AdamW(
+                model.parameters(),
+                lr=config.learning_rate,
+                weight_decay=config.weight_decay,
+                betas=(0.9, 0.95),
+                fused=self.use_amp and fused_available
+            )
+
         self.scaler = torch.amp.GradScaler('cuda') if self.use_amp else None
-        self.scheduler = CosineScheduleWithWarmup(
-            self.optimizer,
-            config.warmup_steps,
-            config.max_steps,
-            config.min_lr
-        )
-
+        self.scheduler = None
         self.total_loss = 0.0
         self.step_count = 0
 
+        # Gradient checkpointing: recompute activations during backward to save activation memory
+        if gradient_checkpointing and hasattr(model, 'set_gradient_checkpointing'):
+            model.set_gradient_checkpointing(True)
+
+        # torch.compile: fuses CUDA kernels and reduces Python overhead.
+        # "reduce-overhead" (CUDA graphs) gives most of the throughput benefit
+        # with a much shorter warmup than "max-autotune", which can spend
+        # 10-20+ minutes autotuning kernels before the first real step.
+        if compile_model and self.use_amp and not self.is_tpu:
+            try:
+                # Compile the actual model, not the Trainer wrapper
+                compiled_model = torch.compile(model, mode="reduce-overhead")
+                self.model = compiled_model.to(self.device)
+                print("torch.compile applied (reduce-overhead mode)")
+            except Exception as e:
+                print(f"torch.compile failed ({e}), using eager mode")
+                self.model = model.to(self.device)
+        else:
+            self.model = model.to(self.device)
+
+        # Enable cuDNN autotuning for fixed input sizes
+        if self.use_amp:
+            torch.backends.cudnn.benchmark = True
+            torch.backends.cudnn.allow_tf32 = True
+
         print(f"Using device: {self.device}")
 
-    def train(
-        self,
-        dataset: Dataset,
-        num_epochs: int = 1,
-        checkpoint_every_pct: float = 5.0,
-        log_every_pct: float = 5.0,
-        checkpoint_dir: str = "checkpoints",
-        keep_all_checkpoints: bool = False,
-        eval_dataset: Optional[Dataset] = None,
-        save_every: int = 0,
-        log_file: str = None,
-    ):
-        """Train the model.
-
-        Progress reporting and checkpointing are percentage-based by default:
-
-        - A single log line is printed every ``log_every_pct`` % of the run
-          (instead of one line per step).
-        - A checkpoint is saved every ``checkpoint_every_pct`` % of the run.
-          The rolling ``lamollm_latest.pt`` is always refreshed; pass
-          ``keep_all_checkpoints=True`` to also keep each milestone file.
-        - Set ``checkpoint_every_pct=0`` and ``save_every=N`` to fall back to
-          classic step-based checkpointing.
-
-        Returns a dict with loss totals and step counts.
-        """
-        if len(dataset) == 0:
-            raise ValueError("Dataset is empty - cannot start training.")
-
+    def train(self, dataset: TextDataset, num_epochs: int = 1, save_every: int = 1000):
+        num_workers = min(8, os.cpu_count() or 4)
         dataloader = DataLoader(
             dataset,
             batch_size=self.config.batch_size,
             shuffle=True,
-            num_workers=0
+            num_workers=num_workers,
+            pin_memory=self.use_amp,
+            persistent_workers=num_workers > 0,
+            prefetch_factor=4 if num_workers > 0 else None,
         )
 
-        eval_loader = None
-        if eval_dataset is not None and len(eval_dataset) > 0:
-            eval_loader = DataLoader(eval_dataset, batch_size=self.config.batch_size, shuffle=False)
-
-        # ---- Plan the run -------------------------------------------------
-        steps_per_epoch = len(dataloader)
-        remaining_cap = max(self.config.max_steps - self.step_count, 0)
-        total_planned = min(steps_per_epoch * num_epochs, remaining_cap)
-        if total_planned <= 0:
-            print("Nothing to train: max_steps already reached.")
-            return {"total_loss": self.total_loss, "steps": self.step_count}
-
-        pct_interval = float(checkpoint_every_pct) if checkpoint_every_pct else 0.0
-        log_interval = float(log_every_pct) if log_every_pct else 0.0
-
-        os.makedirs(checkpoint_dir, exist_ok=True)
-        log_path = log_file or os.path.join(checkpoint_dir, "train_log.jsonl")
-
-        start_step = self.step_count
-        end_step = start_step + total_planned
-
-        n_ckpts = math.ceil(100.0 / pct_interval) if pct_interval > 0 else 0
-        plan_line = (
-            f"\nTraining plan: {total_planned:,} steps "
-            f"(step {start_step:,} -> {end_step:,}) | batch size {self.config.batch_size}"
+        self.scheduler = CosineScheduleWithWarmup(
+            self.optimizer,
+            self.config.warmup_steps,
+            self.config.max_steps,
+            self.config.min_lr
         )
-        if pct_interval > 0:
-            plan_line += f" | checkpoints every {pct_interval:g}% ({n_ckpts} saves)"
-        else:
-            plan_line += f" | checkpoints every {save_every} steps"
-        if log_interval > 0:
-            plan_line += f" | logging every {log_interval:g}%"
-        print(plan_line)
 
         self.model.train()
-        run_start = time.time()
-        window_start = run_start
-        window_tokens = 0
-        window_steps = 0
-        next_ckpt_pct = pct_interval
-        next_log_pct = log_interval
-        EPS = 1e-9
+        global_step = self.step_count
+        accum_steps = self.config.gradient_accumulation_steps
+        max_steps = self.config.max_steps
 
-        stop_reason = "completed"
+        epoch_bar = tqdm(range(num_epochs), desc="Epochs", position=0)
+        batch_bar = tqdm(dataloader, desc="Training", position=1, leave=False)
 
-        for epoch in range(num_epochs):
-            for batch in dataloader:
-                if self.step_count >= end_step:
+        for epoch in epoch_bar:
+            epoch_bar.set_description(f"Epoch {epoch + 1}/{num_epochs}")
+            for batch in batch_bar:
+                if global_step >= max_steps:
                     break
 
-                input_ids = batch["input_ids"].to(self.device)
-                labels = batch["labels"].to(self.device)
+                input_ids = batch["input_ids"].to(self.device, non_blocking=True)
+                labels = batch["labels"].to(self.device, non_blocking=True)
 
                 if self.use_amp:
                     ctx = torch.amp.autocast('cuda', dtype=torch.bfloat16)
                 elif self.is_tpu:
                     ctx = torch.amp.autocast('cpu', dtype=torch.bfloat16)
                 else:
-                    ctx = torch.amp.autocast('cpu', enabled=False)
+                    ctx = torch.cpu.amp.autocast(enabled=False)
 
                 with ctx:
                     result = self.model(input_ids, labels=labels)
-                    loss = result["loss"] / self.config.gradient_accumulation_steps
+                    loss = result["loss"] / accum_steps
 
                 if self.use_amp:
                     self.scaler.scale(loss).backward()
@@ -240,7 +218,11 @@ class Trainer:
                 else:
                     loss.backward()
 
-                if (self.step_count + 1) % self.config.gradient_accumulation_steps == 0:
+                self.total_loss += loss.item() * accum_steps
+                self.step_count += 1
+
+                # Only apply optimizer step when accumulator is full
+                if self.step_count % accum_steps == 0:
                     if self.use_amp:
                         self.scaler.unscale_(self.optimizer)
                     torch.nn.utils.clip_grad_norm_(
@@ -254,166 +236,26 @@ class Trainer:
                         xm.optimizer_step(self.optimizer)
                     else:
                         self.optimizer.step()
-                    self.optimizer.zero_grad()
+                    self.optimizer.zero_grad(set_to_none=True)
                     self.scheduler.step()
+                    global_step += 1
 
-                self.total_loss += loss.item() * self.config.gradient_accumulation_steps
-                self.step_count += 1
-                window_tokens += input_ids.numel()
-                window_steps += 1
+                avg_loss = self.total_loss / self.step_count
+                lr = self.optimizer.param_groups[0]['lr']
+                batch_bar.set_postfix(step=global_step, loss=f"{avg_loss:.4f}", lr=f"{lr:.2e}")
 
-                done = self.step_count - start_step
-                pct = 100.0 * done / total_planned
+                if save_every > 0 and global_step > 0 and global_step % save_every == 0:
+                    self.save_checkpoint(f"checkpoints/lamollm_step_{global_step}.pt", epoch=epoch, global_step=global_step)
 
-                # ---- Classic step-based checkpoints (legacy mode) --------
-                if pct_interval == 0 and save_every > 0 and self.step_count % save_every == 0:
-                    path = os.path.join(checkpoint_dir, f"lamollm_step_{self.step_count}.pt")
-                    self.save_checkpoint(path, global_step=self.step_count, verbose=False)
-                    print(f"[{pct:5.1f}%] checkpoint saved -> {path}")
+            batch_bar.reset()
 
-                # ---- Fire milestones (percentage-based) ------------------
-                # A single console line is emitted per ~5% milestone instead
-                # of spamming progress output after every step.
-                fire_ckpt = False
-                ckpt_marker = None
-                while pct_interval > 0 and pct + EPS >= next_ckpt_pct and next_ckpt_pct <= 100 + EPS:
-                    fire_ckpt = True
-                    ckpt_marker = min(next_ckpt_pct, 100.0)
-                    next_ckpt_pct += pct_interval
+        epoch_bar.close()
+        batch_bar.close()
 
-                fire_log = False
-                log_marker = None
-                while log_interval > 0 and pct + EPS >= next_log_pct and next_log_pct <= 100 + EPS:
-                    fire_log = True
-                    log_marker = min(next_log_pct, 100.0)
-                    next_log_pct += log_interval
+        print(f"\nTraining complete! Final avg loss: {self.total_loss / self.step_count:.4f}")
+        return {"total_loss": self.total_loss, "steps": self.step_count}
 
-                if fire_log or fire_ckpt:
-                    marker = max(m for m in (log_marker, ckpt_marker) if m is not None)
-                    avg_loss = self.total_loss / self.step_count
-                    ppl = math.exp(min(avg_loss, 20.0))
-                    lr = self.optimizer.param_groups[0]['lr']
-
-                    now = time.time()
-                    window_dt = max(now - window_start, 1e-6)
-                    tok_s = window_tokens / window_dt
-                    steps_s = window_steps / window_dt
-                    eta = (total_planned - done) / max(steps_s, 1e-6)
-
-                    # Evaluate once per milestone (when an eval set is given).
-                    val_loss = None
-                    if eval_loader is not None:
-                        val_loss = self.evaluate(eval_loader)
-
-                    segs = []
-                    if fire_log:
-                        segs.append(f"step {self.step_count}/{end_step}")
-                        segs.append(f"loss {avg_loss:.4f}")
-                        segs.append(f"ppl {ppl:.2f}")
-                        segs.append(f"lr {lr:.2e}")
-                        segs.append(f"{tok_s:,.0f} tok/s")
-                        segs.append(f"ETA {_fmt_duration(eta)}")
-
-                    saved_to = None
-                    if fire_ckpt:
-                        latest_path = os.path.join(checkpoint_dir, "lamollm_latest.pt")
-                        self.save_checkpoint(latest_path, global_step=self.step_count, verbose=False)
-                        if keep_all_checkpoints:
-                            name = f"lamollm_{_fmt_pct(ckpt_marker)}_step_{self.step_count}.pt"
-                            milestone_path = os.path.join(checkpoint_dir, name)
-                            self.save_checkpoint(milestone_path, global_step=self.step_count, verbose=False)
-                            saved_to = milestone_path
-                        else:
-                            saved_to = latest_path
-                        segs.append(f"ckpt -> {os.path.basename(saved_to)}")
-
-                    if val_loss is not None:
-                        segs.append(f"val_loss {val_loss:.4f}")
-
-                    bar = _render_bar(marker / 100.0)
-                    print(f"[{marker:5.1f}%|{bar}] " + " | ".join(segs))
-
-                    record = {
-                        "percent": round(marker, 2),
-                        "actual_percent": round(min(pct, 100.0), 2),
-                        "step": self.step_count,
-                        "epoch": epoch + 1,
-                        "loss": round(avg_loss, 6),
-                        "val_loss": round(val_loss, 6) if val_loss is not None else None,
-                        "lr": lr,
-                        "tokens_per_sec": round(tok_s, 1),
-                        "elapsed_sec": round(now - run_start, 1),
-                        "checkpoint": os.path.basename(saved_to) if saved_to else None,
-                    }
-                    try:
-                        with open(log_path, "a", encoding="utf-8") as f:
-                            f.write(json.dumps(record) + "\n")
-                    except OSError:
-                        pass
-
-                    window_start = time.time()
-                    window_tokens = 0
-                    window_steps = 0
-
-                if self.step_count >= end_step:
-                    stop_reason = "max_steps" if self.config.max_steps <= end_step else "completed"
-                    break
-
-            if self.step_count >= end_step:
-                break
-
-        # ---- Final wrap-up -------------------------------------------------
-        elapsed = time.time() - run_start
-        final_avg_loss = self.total_loss / self.step_count
-        final_ppl = math.exp(min(final_avg_loss, 20.0))
-
-        final_val = None
-        if eval_loader is not None:
-            final_val = self.evaluate(eval_loader)
-
-        final_path = os.path.join(checkpoint_dir, "lamollm_final.pt")
-        self.save_checkpoint(final_path, global_step=self.step_count, verbose=False)
-        val_txt = f" | val_loss {final_val:.4f}" if final_val is not None else ""
-        print(
-            f"\nTraining finished ({stop_reason}) in {_fmt_duration(elapsed)} | "
-            f"avg loss {final_avg_loss:.4f} | ppl {final_ppl:.2f}{val_txt}\n"
-            f"Final checkpoint -> {final_path}"
-        )
-
-        return {
-            "total_loss": self.total_loss,
-            "avg_loss": final_avg_loss,
-            "val_loss": final_val,
-            "steps": self.step_count,
-        }
-
-    @torch.no_grad()
-    def evaluate(self, eval_loader: DataLoader, max_batches: Optional[int] = None) -> float:
-        """Average loss over the evaluation set."""
-        was_training = self.model.training
-        self.model.eval()
-        total, count = 0.0, 0
-        for i, batch in enumerate(eval_loader):
-            if max_batches is not None and i >= max_batches:
-                break
-            input_ids = batch["input_ids"].to(self.device)
-            labels = batch["labels"].to(self.device)
-
-            if self.use_amp:
-                ctx = torch.amp.autocast('cuda', dtype=torch.bfloat16)
-            elif self.is_tpu:
-                ctx = torch.amp.autocast('cpu', dtype=torch.bfloat16)
-            else:
-                ctx = torch.amp.autocast('cpu', enabled=False)
-            with ctx:
-                result = self.model(input_ids, labels=labels)
-            total += result["loss"].item()
-            count += 1
-        if was_training:
-            self.model.train()
-        return total / max(count, 1)
-
-    def save_checkpoint(self, path: str, epoch: int = 0, global_step: int = 0, verbose: bool = True):
+    def save_checkpoint(self, path: str, epoch: int = 0, global_step: int = 0):
         os.makedirs(os.path.dirname(path) if os.path.dirname(path) else '.', exist_ok=True)
         state = {
             'model_state_dict': self.model.state_dict(),
@@ -432,14 +274,8 @@ class Trainer:
             state['scheduler_step_count'] = self.scheduler.step_count
         if self.scaler is not None:
             state['scaler_state_dict'] = self.scaler.state_dict()
-        # Atomic write: save to a temp file first, then swap it in. If the
-        # process dies mid-save, the previous checkpoint stays intact instead
-        # of being left half-written/corrupt (critical on Colab/Drive).
-        tmp_path = path + ".tmp"
-        torch.save(state, tmp_path)
-        os.replace(tmp_path, path)
-        if verbose:
-            print(f"Checkpoint saved to {path}")
+        torch.save(state, path)
+        print(f"Checkpoint saved to {path}")
 
     def load_checkpoint(self, path: str):
         checkpoint = torch.load(path, map_location=self.device, weights_only=False)
@@ -450,12 +286,12 @@ class Trainer:
                                for k, v in optimizer_state.items()}
         self.optimizer.load_state_dict(optimizer_state)
         self.total_loss = checkpoint.get('total_loss', 0.0)
-        self.step_count = checkpoint.get('step_count', checkpoint.get('global_step', 0))
+        self.step_count = checkpoint.get('step_count', 0)
         if self.scheduler is not None and 'scheduler_step_count' in checkpoint:
             self.scheduler.step_count = checkpoint['scheduler_step_count']
         if self.scaler is not None and 'scaler_state_dict' in checkpoint:
             self.scaler.load_state_dict(checkpoint['scaler_state_dict'])
         epoch = checkpoint.get('epoch', 0)
         global_step = checkpoint.get('global_step', 0)
-        print(f"Checkpoint loaded from {path} (epoch {epoch}, step {global_step}, avg loss {self.total_loss / max(self.step_count, 1):.4f})")
+        print(f"Checkpoint loaded from {path} (epoch {epoch}, step {global_step}, loss {self.total_loss:.4f})")
         return {'epoch': epoch, 'global_step': global_step}

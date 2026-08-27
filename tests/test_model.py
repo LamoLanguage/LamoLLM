@@ -29,11 +29,11 @@ class TestLamoLLM:
         assert tiny_model is not None
         assert isinstance(tiny_model, LamoLLM)
 
-    def test_forward_pass(self, tiny_model, tiny_config):
+    def test_forward_pass(self, tiny_model):
         input_ids = torch.randint(0, 100, (2, 32))
         output = tiny_model(input_ids)
         assert "logits" in output
-        assert output["logits"].shape == (2, 32, tiny_config.vocab_size)
+        assert output["logits"].shape == (2, 32, 100)
 
     def test_forward_with_labels(self, tiny_model):
         input_ids = torch.randint(0, 100, (2, 32))

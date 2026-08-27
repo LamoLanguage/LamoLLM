@@ -4,3 +4,7 @@ tiktoken>=0.5.0
 datasets>=2.14.0
 tqdm>=4.65.0
 accelerate>=0.22.0
+
+# Optional: enables config.use_8bit_optimizer=True (roughly halves AdamW
+# optimizer state memory). Not required otherwise.
+bitsandbytes>=0.43.0; sys_platform != "darwin"

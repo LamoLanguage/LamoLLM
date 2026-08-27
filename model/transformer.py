@@ -6,17 +6,27 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
-def precompute_freqs_cis(dim: int, max_seq_len: int, theta: float = 10000.0) -> torch.Tensor:
-    freqs = 1.0 / (theta ** (torch.arange(0, dim, 2).float() / dim))
+def precompute_freqs_cis(dim: int, max_seq_len: int, theta: float = 10000.0) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Precompute RoPE cos/sin tables as real-valued tensors.
+
+    Real-valued cos/sin (instead of torch.polar/view_as_complex) avoids
+    complex-dtype ops, which torch.compile supports poorly and often
+    falls back to eager mode / graph-breaks on.
+    """
+    inv_freq = 1.0 / (theta ** (torch.arange(0, dim, 2).float() / dim))
     t = torch.arange(max_seq_len, dtype=torch.float32)
-    freqs = torch.outer(t, freqs)
-    return torch.polar(torch.ones_like(freqs), freqs)
+    freqs = torch.outer(t, inv_freq)
+    return torch.cos(freqs), torch.sin(freqs)
 
 
-def apply_rotary_emb(x: torch.Tensor, freqs_cis: torch.Tensor) -> torch.Tensor:
-    x_complex = torch.view_as_complex(x.float().reshape(*x.shape[:-1], -1, 2))
-    freqs_cis = freqs_cis.unsqueeze(0).unsqueeze(0)
-    x_rotated = torch.view_as_real(x_complex * freqs_cis).flatten(-2)
+def apply_rotary_emb(x: torch.Tensor, freqs_cis: Tuple[torch.Tensor, torch.Tensor]) -> torch.Tensor:
+    cos, sin = freqs_cis
+    cos = cos.unsqueeze(0).unsqueeze(0)
+    sin = sin.unsqueeze(0).unsqueeze(0)
+
+    x1 = x[..., 0::2]
+    x2 = x[..., 1::2]
+    x_rotated = torch.stack([x1 * cos - x2 * sin, x1 * sin + x2 * cos], dim=-1).flatten(-2)
     return x_rotated.type_as(x)
 
 
@@ -52,7 +62,7 @@ class attention(nn.Module):
     def forward(
         self,
         x: torch.Tensor,
-        freqs_cis: torch.Tensor,
+        freqs_cis: Tuple[torch.Tensor, torch.Tensor],
         mask: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
         bsz, seq_len, _ = x.shape
@@ -109,13 +119,27 @@ class TransformerBlock(nn.Module):
         self.feed_forward = FeedForward(config)
         self.attention_norm = RMSNorm(config.d_model, eps=config.norm_eps)
         self.ffn_norm = RMSNorm(config.d_model, eps=config.norm_eps)
+        self.use_checkpoint = False
 
     def forward(
         self,
         x: torch.Tensor,
-        freqs_cis: torch.Tensor,
+        freqs_cis: Tuple[torch.Tensor, torch.Tensor],
         mask: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
-        x = x + self.attention(self.attention_norm(x), freqs_cis, mask)
-        x = x + self.feed_forward(self.ffn_norm(x))
+        # Gradient checkpointing: trade compute for memory by not storing all intermediate activations
+        def fwd_attn(x_inner):
+            return self.attention(self.attention_norm(x_inner), freqs_cis, mask)
+
+        def fwd_ffn(x_inner):
+            return self.feed_forward(self.ffn_norm(x_inner))
+
+        # use_reentrant=False: recommended mode (better torch.compile compatibility,
+        # avoids some autograd edge cases the legacy reentrant mode has)
+        if self.use_checkpoint and self.training:
+            x = x + torch.utils.checkpoint.checkpoint(fwd_attn, x, use_reentrant=False)
+            x = x + torch.utils.checkpoint.checkpoint(fwd_ffn, x, use_reentrant=False)
+        else:
+            x = x + self.attention(self.attention_norm(x), freqs_cis, mask)
+            x = x + self.feed_forward(self.ffn_norm(x))
         return x
